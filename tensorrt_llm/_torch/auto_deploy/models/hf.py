@@ -95,6 +95,111 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 
 
 # TODO (lucaslie): continue working on the base class
+_STRICT_KWARG_ERR = re.compile(
+    r"(\w+)\.(__post_init__|__init__)\(\) "
+    r"got an unexpected keyword argument '(\w+)'"
+)
+
+
+def _find_class_in_traceback(tb, class_name: str) -> Optional[type]:
+    """Walk traceback frames for one whose `self` is an instance of class_name."""
+    while tb is not None:
+        self_obj = tb.tb_frame.f_locals.get("self")
+        if self_obj is not None and type(self_obj).__name__ == class_name:
+            return type(self_obj)
+        tb = tb.tb_next
+    return None
+
+
+def _make_tolerant_post_init(original):
+    """Wrap a __post_init__ to absorb unrecognized kwargs as attribute assignments.
+
+    Pre-transformers-5.x configs (e.g. apple/OpenELM-* published under
+    transformers 4.39.3) defined `__post_init__` to take only `self`. The 5.x
+    `@strict`-wrapped `PretrainedConfig.__init__` forwards unrecognized
+    config_dict fields through `__post_init__` as kwargs, breaking those
+    configs. The wrapper replays the kwargs as attribute assignments (the
+    work the source `__init__` was supposed to do), then invokes the original
+    for validation. `AttributeError` is swallowed so the no-arg empty-instance
+    construction path (used by transformers' `to_diff_dict` during repr)
+    remains a no-op rather than crashing on missing attributes.
+    """
+
+    def tolerant(self, **kwargs):
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+        try:
+            original(self)
+        except AttributeError:
+            pass
+
+    return tolerant
+
+
+def _call_with_strict_compat(fn, *args, **kwargs):
+    """Call ``fn(*args, **kwargs)`` and bridge transformers 5.x `@strict`-class
+    kwarg-forwarding rejections from HF classes written before that convention.
+
+    transformers 5.x decorated `PretrainedConfig` and `PreTrainedModel` with
+    `@strict`, which wraps `__init__` to forward unrecognized kwargs through
+    `**additional_kwargs` to `__post_init__` (config) or the subclass
+    `__init__` (model). Classes written earlier reject the forwarded kwargs
+    with `TypeError`. Two failure modes surface in the AutoDeploy model
+    registry (see https://github.com/NVIDIA/TensorRT-LLM/issues/14672):
+
+    * ``apple/OpenELM-*``: ``OpenELMConfig.__post_init__(self)`` rejects
+      ``use_cache`` (and every other ``config.json`` field).
+    * ``Qwen/Qwen3.5-0.8B``, ``Qwen/Qwen3.5-27B``:
+      ``Qwen3_5ForCausalLM.__init__()`` rejects ``use_cache`` forwarded by
+      ``from_config``.
+
+    Remediation differs by which method rejected:
+
+    * ``__post_init__``: monkey-patch the offending class with a tolerant
+      version (:func:`_make_tolerant_post_init`) that absorbs the forwarded
+      kwargs as attribute assignments, then retry. Restored on return.
+    * ``__init__``: pop the offending kwarg from the call's kwargs (logging
+      a warning) and retry. The dropped value is typically a model default
+      already encoded in the config and recoverable downstream.
+
+    Non-matching ``TypeError`` instances propagate unchanged.
+    """
+    patched: List[Tuple[type, str, Any]] = []
+    try:
+        while True:
+            try:
+                return fn(*args, **kwargs)
+            except TypeError as exc:
+                match = _STRICT_KWARG_ERR.search(str(exc))
+                if match is None:
+                    raise
+                class_name, method, bad_kwarg = (
+                    match.group(1),
+                    match.group(2),
+                    match.group(3),
+                )
+                if method == "__post_init__":
+                    target_cls = _find_class_in_traceback(exc.__traceback__, class_name)
+                    if target_cls is None or any(cls is target_cls for cls, _, _ in patched):
+                        raise
+                    original = target_cls.__post_init__
+                    patched.append((target_cls, "__post_init__", original))
+                    target_cls.__post_init__ = _make_tolerant_post_init(original)
+                else:  # __init__
+                    if bad_kwarg not in kwargs:
+                        raise
+                    ad_logger.warning(
+                        f"Stripping kwarg `{bad_kwarg}={kwargs[bad_kwarg]!r}` "
+                        f"from {class_name}.__init__ (transformers 5.x "
+                        f"@strict compat). See "
+                        f"https://github.com/NVIDIA/TensorRT-LLM/issues/14672."
+                    )
+                    kwargs.pop(bad_kwarg)
+    finally:
+        for cls, method_name, original in patched:
+            setattr(cls, method_name, original)
+
+
 class AutoModelFactory(ModelFactory):
     @property
     @abstractmethod
@@ -250,8 +355,11 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
         # we want to recursively update model_config from model_kwargs here.
-        model_config, unused_kwargs = AutoConfig.from_pretrained(
-            self.model, return_unused_kwargs=True, trust_remote_code=True
+        model_config, unused_kwargs = _call_with_strict_compat(
+            AutoConfig.from_pretrained,
+            self.model,
+            return_unused_kwargs=True,
+            trust_remote_code=True,
         )
         model_config, nested_unused_kwargs = self._recursive_update_config(
             model_config, self.model_kwargs
@@ -276,9 +384,12 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
                         f"`{custom_model_cls.__name__}` must have a `_from_config` class method. "
                         "Consider inheriting from `PreTrainedModel`."
                     )
-                model = custom_model_cls._from_config(model_config, **unused_kwargs)
+                model = _call_with_strict_compat(
+                    custom_model_cls._from_config, model_config, **unused_kwargs
+                )
             else:
-                model = self.automodel_cls.from_config(
+                model = _call_with_strict_compat(
+                    self.automodel_cls.from_config,
                     model_config,
                     **{
                         "trust_remote_code": True,

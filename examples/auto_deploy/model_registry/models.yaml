@@ -13,18 +13,15 @@ models:
 - name: Qwen/Qwen3-0.6B
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'enable_sharder_ir.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-270M-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-1_1B-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# TypeError: OpenELMConfig.__post_init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: apple/OpenELM-3B-Instruct
-#   config_id: openelm
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-270M-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-1_1B-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-3B-Instruct
+  config_id: openelm
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
 # ImportError: cannot import name 'LossKwargs' from 'transformers.utils' (/usr/local/lib/python3.12/dist-packages/transformers/utils/__init__.py)
 # - name: microsoft/Phi-4-mini-instruct
 #   config_id: default_ws_1
@@ -365,14 +362,12 @@ models:
 # Model list for sprint
 # =============================================================================
 # --- Qwen3.5 dense (Feb 2026) ---
-# TypeError: Qwen3_5ForCausalLM.__init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: Qwen/Qwen3.5-0.8B
-#   config_id: default_ws_1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
-# TypeError: Qwen3_5ForCausalLM.__init__() got an unexpected keyword argument 'use_cache'. See https://github.com/NVIDIA/TensorRT-LLM/issues/14672
-# - name: Qwen/Qwen3.5-27B
-#   config_id: default_ws_4
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: Qwen/Qwen3.5-0.8B
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: Qwen/Qwen3.5-27B
+  config_id: default_ws_4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Qwen3.5 MoE (Feb 2026) ---
 # tensorrt_llm.executor.utils.RequestError: Ran into a kwarg keyword mismatch.
 # - name: Qwen/Qwen3.5-35B-A3B
