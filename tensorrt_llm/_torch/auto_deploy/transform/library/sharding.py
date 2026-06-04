@@ -2855,9 +2855,13 @@ def _process_mla_sharding(
 
 def _determine_fused_weight_dims(
     linear_nodes: List[Node],
-) -> None:
+) -> Optional[List[int]]:
     """
     Determine the fused weight dims for the given linear nodes and subgraph nodes.
+
+    Returns the list of fused output dims (e.g. [q, k, v] sizes for a fused QKV
+    projection, or per-chunk sizes for a fused gate_up projection), or None if
+    the single linear node's users do not indicate a fused weight.
     """
     if len(linear_nodes) != 1:
         return None
@@ -2899,6 +2903,8 @@ def _determine_fused_weight_dims(
             num_chunks = linear_chunk_users[0].args[1]
             weight_dim = linear_node.meta["val"].shape[2]
             fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+
+    return fused_weight_dims
 
 
 def _find_upstream_qk_proj(node: Node, gm: GraphModule) -> Optional[str]:
