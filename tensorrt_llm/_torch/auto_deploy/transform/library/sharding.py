@@ -351,12 +351,14 @@ class ShardingTransformConfig(TransformConfig):
 
             values = set(tp_plan.values())
             supported_modes = {
-                "colwise",  # row split and no collective
-                "rowwise",  # column split and all-reduce
+                "colwise",  # column split, no collective (output stays sharded)
+                "colwise_gather_output",  # HF phi3/4 fused qkv/gate_up -> colwise
+                "rowwise",  # row split + all_reduce
+                "rowwise_split_input",  # HF phi3/4 o_proj/down_proj -> rowwise
                 "mla",  # mla layer
                 "mamba",  # mamba SSM layer
                 "delta",  # gated delta net layer
-                "gather",  # simple shard (row + all_gather)
+                "gather",  # simple shard (column + all_gather)
                 # TODO: remaining values are not supported yet.
                 # They require hybrid EP+TP and/or SP support.
                 # "sequence_parallel", # sequence parallelism
@@ -3274,12 +3276,26 @@ def detect_sharding_from_config(
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
 
-                if config == "colwise":
+                # HF transformers' phi3/phi-4 base_model_tp_plan tags the fused
+                # qkv_proj / gate_up_proj with the compound policy
+                # "colwise_gather_output" (column-parallel + all_gather, i.e. it
+                # replicates attention across ranks) and o_proj / down_proj with
+                # "rowwise_split_input". Map the column variants onto efficient
+                # column head-sharding via _process_column_sharding (which splits
+                # the fused q/k/v sub-blocks and rewrites the downstream slice
+                # indices) and the row variants onto the standard row-shard +
+                # all_reduce. Paired this way the result is the numerically
+                # identical Megatron column->row decomposition WITHOUT replicating
+                # attention, and the factory pass claims both the opening and
+                # closing projections consistently -- so nothing is left for the
+                # heuristic pass to back-fill with a contradictory plan.
+                # See https://github.com/NVIDIA/TensorRT-LLM/issues/14679.
+                if config in ("colwise", "colwise_gather_output"):
                     _process_column_sharding(
                         layer_subgraph=layer_subgraph,
                         transform_container=transform_container,
                     )
-                elif config == "rowwise":
+                elif config in ("rowwise", "rowwise_split_input"):
                     if transform_container.add(
                         WeightShardingInfo.from_node(
                             lin_node,
@@ -3352,9 +3368,13 @@ def detect_sharding_from_config(
                     ):
                         num_simple_shards += 1
                 else:
-                    ad_logger.debug(
-                        f"Unsupported sharding action {config}. "
-                        f"Linear node {lin_node} will not be sharded."
+                    # Loud: an unrecognized tp_plan policy leaves this linear
+                    # un-sharded while its layer partner may be sharded, which
+                    # surfaces later as an opaque reduction-dim mismatch.
+                    ad_logger.warning(
+                        f"Unsupported tp_plan sharding action '{config}'. "
+                        f"Linear node {lin_node} will not be sharded, which may "
+                        f"cause a downstream shape mismatch."
                     )
                 # after successful match, break the loop
                 break

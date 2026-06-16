@@ -33,6 +33,7 @@ import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMamba2Mixer
+from tensorrt_llm._torch.auto_deploy.models.factory import ShardingConfigSource
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     FineGrainedFP8WeightShardingInfo,
     FP8WeightShardingInfo,
@@ -1736,3 +1737,102 @@ def test_fused_proj_fused_dims_detection(model_cls, fused_node_substr, expected_
             "would be split as a monolith with stale slice/chunk indices (#14679)"
         )
         assert tuple(t.fused_weight_dims) == expected_fused_dims
+
+
+class _HFTpPlanFactory:
+    """Minimal ModelFactory stand-in supplying an HF base_model_tp_plan.
+
+    ``detect_sharding`` reads the factory tp_plan via
+    ``factory.get_sharding_config()``; only that method is exercised by the
+    pattern-detection path (no model build / export / weight movement).
+    """
+
+    def __init__(self, tp_plan):
+        self._tp_plan = tp_plan
+
+    def get_sharding_config(self):
+        return {"source": ShardingConfigSource.HUGGINGFACE, "tp_plan": self._tp_plan}
+
+
+@pytest.mark.parametrize(
+    "model_cls, fused_node_substr, expected_fused_dims, row_node_substr, tp_plan",
+    (
+        (
+            Phi3FusedAttnBlock,
+            "qkv_proj",
+            (64, 16, 16),
+            "o_proj",
+            {"qkv_proj": "colwise_gather_output", "o_proj": "rowwise_split_input"},
+        ),
+        (
+            Phi3FusedMLP,
+            "gate_up_proj",
+            (128, 128),
+            "down_proj",
+            {"gate_up_proj": "colwise_gather_output", "down_proj": "rowwise_split_input"},
+        ),
+    ),
+)
+def test_factory_phi3_compound_tp_plan(
+    model_cls, fused_node_substr, expected_fused_dims, row_node_substr, tp_plan
+):
+    """Factory source must honor HF phi3/phi-4 compound tp_plan policy strings.
+
+    Regression test for https://github.com/NVIDIA/TensorRT-LLM/issues/14679
+    (factory path). ``detect_sharding_from_config`` matched only the exact
+    strings ``"colwise"`` / ``"rowwise"``, so phi-3/phi-4's
+    ``"colwise_gather_output"`` fell into the generic ``gather`` branch
+    (column split + all_gather, full-width output, no fused dims) and
+    ``"rowwise_split_input"`` matched nothing and was silently dropped --
+    leaving o_proj / down_proj unsharded. A subsequent heuristic back-fill then
+    row-sharded the closing projection assuming half-width input, contradicting
+    the gathered full-width output and producing a reduction-dim mismatch. The
+    fix maps the compound column variant onto efficient fused column
+    head-sharding and the row variant onto standard row-shard + all_reduce, so
+    the factory pass claims both projections consistently (nothing is left for
+    the heuristic pass to back-fill).
+    """
+    world_size = 2
+    model = model_cls().to(device="cuda", dtype=torch.float16)
+    x = torch.randn(2, 4, 64, device="cuda", dtype=torch.float16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    optimizer = InferenceOptimizer(
+        _HFTpPlanFactory(tp_plan),
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_scope": ["tp"],
+                "sharding_source": ["factory"],
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = 0
+    optimizer.shared_config.world_size = world_size
+    _ = optimizer(None, gm)
+
+    infos = gm._sharding_transform_container.weight_sharding_transforms
+
+    # Fused opening projection -> efficient column head-shard: fused dims set and
+    # NO all_gather, proving "colwise_gather_output" no longer falls into the
+    # gather/simple-shard branch (which would monolith-split it).
+    fused_infos = [t for t in infos if fused_node_substr in t.target_node]
+    assert fused_infos, f"factory source did not shard {fused_node_substr}"
+    for t in fused_infos:
+        assert t.split_dim == SplitDimension.COLUMN
+        assert t.dist_op is None
+        assert tuple(t.fused_weight_dims or ()) == expected_fused_dims, (
+            f"{t.target_node}: colwise_gather_output must map to fused column "
+            f"head-sharding with dims {expected_fused_dims} (#14679 factory path)"
+        )
+
+    # Closing projection -> row-shard + all_reduce; previously
+    # "rowwise_split_input" was silently dropped and left it unsharded.
+    row_infos = [t for t in infos if row_node_substr in t.target_node]
+    assert row_infos, (
+        f"factory source silently dropped rowwise_split_input for "
+        f"{row_node_substr}; it would be left unsharded (#14679 factory path)"
+    )
+    for t in row_infos:
+        assert t.split_dim == SplitDimension.ROW
+        assert t.dist_op == "all_reduce"
