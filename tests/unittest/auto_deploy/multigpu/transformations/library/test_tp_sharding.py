@@ -40,6 +40,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ShardingTransformConfig,
     SplitDimension,
     WeightShardingInfo,
+    _determine_fused_weight_dims,
     _update_node_args,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
@@ -1637,3 +1638,135 @@ def test_moe_tp_shard_nvfp4(device_count: int, num_experts: int):
         job=partial(_run_nvfp4_moe_tp_shard_job, num_experts),
         size=device_count,
     )
+
+
+class Phi3FusedAttnBlock(nn.Module):
+    """Phi-3/Phi-4-style attention with a FUSED qkv projection.
+
+    Mirrors HF ``Phi3Attention.forward``: a single qkv_proj followed by
+    absolute-index slices for q/k/v. Regression fixture for
+    https://github.com/NVIDIA/TensorRT-LLM/issues/14679.
+    """
+
+    def __init__(self, hidden_size=64, num_heads=8, num_kv_heads=2):
+        super().__init__()
+        self.head_dim = hidden_size // num_heads
+        self.query_pos = num_heads * self.head_dim
+        self.kv_size = num_kv_heads * self.head_dim
+        op_size = self.query_pos + 2 * self.kv_size
+        self.qkv_proj = nn.Linear(hidden_size, op_size, bias=False)
+        self.o_proj = nn.Linear(self.query_pos, hidden_size, bias=False)
+
+    def forward(self, x):
+        b, s, _ = x.shape
+        qkv = self.qkv_proj(x)
+        q = qkv[..., : self.query_pos]
+        k = qkv[..., self.query_pos : self.query_pos + self.kv_size]
+        v = qkv[..., self.query_pos + self.kv_size :]
+        q = q.view(b, s, -1, self.head_dim)
+        k = k.view(b, s, -1, self.head_dim)
+        v = v.view(b, s, -1, self.head_dim)
+        y = torch.ops.auto_deploy.torch_attention(q, k, v, is_causal=True, layout="bsnd")
+        y = y.contiguous().view(b, s, -1)
+        return self.o_proj(y)
+
+
+class Phi3FusedMLP(nn.Module):
+    """Phi-3/Phi-4-style MLP with a FUSED gate_up projection + chunk(2).
+
+    Mirrors HF ``Phi3MLP.forward``. Regression fixture for
+    https://github.com/NVIDIA/TensorRT-LLM/issues/14679.
+    """
+
+    def __init__(self, hidden_size=64, intermediate_size=128):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+    def forward(self, x):
+        up_states = self.gate_up_proj(x)
+        gate, up_states = up_states.chunk(2, dim=-1)
+        up_states = up_states * F.silu(gate)
+        return self.down_proj(up_states)
+
+
+@pytest.mark.parametrize(
+    "model_cls, fused_node_substr, expected_fused_dims",
+    (
+        (Phi3FusedAttnBlock, "qkv_proj", (64, 16, 16)),
+        (Phi3FusedMLP, "gate_up_proj", (128, 128)),
+    ),
+)
+def test_fused_proj_fused_dims_detection(model_cls, fused_node_substr, expected_fused_dims):
+    """Fused projections must be sharded with per-component fused_weight_dims.
+
+    Regression test for https://github.com/NVIDIA/TensorRT-LLM/issues/14679:
+    ``_determine_fused_weight_dims`` computed the fused dims but did not
+    return them, so fused weights (Phi-3/Phi-4 qkv_proj and gate_up_proj)
+    were column-sharded as monoliths and the downstream slice/chunk indices
+    were never rewritten, breaking shape propagation under TP > 1.
+    """
+    world_size = 2
+    model = model_cls().to(device="cuda", dtype=torch.float16)
+    x = torch.randn(2, 4, 64, device="cuda", dtype=torch.float16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_scope": ["tp"],
+                "sharding_source": ["heuristic"],
+                "shard_all_unprocessed": True,
+                "manual_config": {"tp_plan": {}},
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = 0
+    optimizer.shared_config.world_size = world_size
+    _ = optimizer(None, gm)
+
+    infos = gm._sharding_transform_container.weight_sharding_transforms
+    fused_infos = [t for t in infos if fused_node_substr in t.target_node]
+    assert fused_infos, f"no sharding transform detected for {fused_node_substr}"
+    for t in fused_infos:
+        assert t.split_dim == SplitDimension.COLUMN
+        assert t.fused_weight_dims is not None, (
+            f"{t.target_node} sharded without fused_weight_dims; fused weight "
+            "would be split as a monolith with stale slice/chunk indices (#14679)"
+        )
+        assert tuple(t.fused_weight_dims) == expected_fused_dims
+
+
+@pytest.mark.parametrize(
+    "model_cls, expected_fused_dims",
+    (
+        (Phi3FusedAttnBlock, [64, 16, 16]),
+        (Phi3FusedMLP, [128, 128]),
+    ),
+)
+def test_determine_fused_weight_dims_returns_component_sizes(model_cls, expected_fused_dims):
+    """Unit-level check of _determine_fused_weight_dims, isolated from sharding.
+
+    Hands each linear node of the exported block straight to the function and
+    verifies it returns the fused projection's per-component output sizes, None
+    for the non-fused closing projection, and None for the != 1 node guard.
+    See https://github.com/NVIDIA/TensorRT-LLM/issues/14679.
+    """
+    model = model_cls().to(device="cuda", dtype=torch.float16)
+    x = torch.randn(2, 4, 64, device="cuda", dtype=torch.float16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    lin_nodes = [n for n in gm.graph.nodes if is_linear_op(n)]
+    results = [_determine_fused_weight_dims([n]) for n in lin_nodes]
+
+    # exactly one linear in the block is fused; it returns its per-component sizes
+    fused = [r for r in results if r is not None]
+    assert len(fused) == 1, f"expected one fused projection, got {results}"
+    assert list(fused[0]) == expected_fused_dims
+    # the non-fused closing projection (o_proj / down_proj) -> None
+    assert any(r is None for r in results)
+    # guard: the helper only handles exactly one linear node
+    assert _determine_fused_weight_dims(lin_nodes) is None
+    assert _determine_fused_weight_dims([]) is None
