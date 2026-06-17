@@ -208,9 +208,49 @@ def _clear_default_rope_scaling_for_custom_models(config):
                     pass
 
 
+# Phi-3/Phi-4 declare their fused projections in ``base_model_tp_plan`` with HF's
+# compound TP policies: qkv_proj / gate_up_proj as "colwise_gather_output" and
+# o_proj / down_proj as "rowwise_split_input". Those all-gather the fused column
+# output to full width and then split the replicated input again -- HF does this
+# because its DTensor sharder cannot rewrite the fused slice/chunk indices (see the
+# config comments: "we need to replicate here due to the slicing of qkv" / "the
+# `chunk` operation"). AutoDeploy's column sharder DOES rewrite those indices (via
+# ``_determine_fused_weight_dims``), so the gather is unnecessary: the pure
+# colwise -> rowwise pairing is numerically identical and shards attention across
+# ranks instead of replicating it.
+#
+# We rewrite these entries to their pure forms for Phi-3/Phi-4 ONLY -- we do not
+# reinterpret the compound policies globally, since another model may legitimately
+# require the gather. Scoped by ``model_type == "phi3"`` (Phi-4 reuses the Phi-3
+# config) and keyed on the policy value, so the glob keys are irrelevant.
+_PURE_TP_POLICY = {
+    "colwise_gather_output": "colwise",
+    "rowwise_split_input": "rowwise",
+}
+
+
+def _override_phi_fused_tp_plan(config):
+    """Rewrite Phi-3/Phi-4 fused-projection tp_plan policies to their pure forms.
+
+    See the note above: HF's gather/split policies are an index-rewrite workaround
+    that AutoDeploy does not need. Replaces ``config.base_model_tp_plan`` with a
+    fresh dict (never mutating the class-level default) for Phi-3/Phi-4 configs.
+    """
+    if getattr(config, "model_type", None) != "phi3":
+        return
+    tp_plan = getattr(config, "base_model_tp_plan", None)
+    if not isinstance(tp_plan, Mapping):
+        return
+    overrides = {k: _PURE_TP_POLICY[v] for k, v in tp_plan.items() if v in _PURE_TP_POLICY}
+    if overrides:
+        # copy: base_model_tp_plan is a class attribute shared across instances.
+        config.base_model_tp_plan = {**tp_plan, **overrides}
+
+
 def get_model_from_config_patched(config, **kwargs):
     _ensure_rope_scaling_type_key(config)
     _clear_default_rope_scaling_for_custom_models(config)
+    _override_phi_fused_tp_plan(config)
     # For VL models, also fix text_config which is used by the inner text model.
     text_config = getattr(config, "text_config", None)
     if text_config is not None:
